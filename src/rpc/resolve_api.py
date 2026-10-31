@@ -90,9 +90,55 @@ def is_running() -> bool:
     return bool(_resolve_pids())
 
 
+def resolve_uptime() -> float:
+    """Seconds since the oldest Resolve.exe started (0 if unknown)."""
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = wintypes.HANDLE
+    oldest = None
+    for pid in _resolve_pids():
+        h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            continue
+        try:
+            c, e, kk, u = (wintypes.FILETIME() for _ in range(4))
+            if k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e), ctypes.byref(kk), ctypes.byref(u)):
+                t = (c.dwHighDateTime << 32 | c.dwLowDateTime) / 1e7 - 11644473600
+                oldest = t if oldest is None else min(oldest, t)
+        finally:
+            k32.CloseHandle(h)
+    return max(0.0, time.time() - oldest) if oldest else 0.0
+
+
+def _clean_env() -> dict:
+    """Environment for Resolve without any trace of our bundled Python.
+
+    A PyInstaller exe puts its temp dir on the DLL search path and PATH; a child
+    started from it would load our python311.dll (breaking Resolve's own Python
+    scripting and locking the temp dir so the exe can't exit).
+    """
+    env = dict(os.environ)
+    bundle = getattr(sys, "_MEIPASS", None)
+    if bundle:
+        parts = [p for p in env.get("PATH", "").split(os.pathsep)
+                 if p and not os.path.normcase(p).startswith(os.path.normcase(bundle))]
+        env["PATH"] = os.pathsep.join(parts)
+    for k in list(env):
+        if k.upper() in ("TCL_LIBRARY", "TK_LIBRARY", "PYTHONHOME", "PYTHONPATH") or k.startswith("_PYI"):
+            env.pop(k, None)
+    return env
+
+
 def launch(install: Path) -> None:
-    subprocess.Popen([str(install / "Resolve.exe")], cwd=str(install),
-                     creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+    if getattr(sys, "frozen", False):
+        ctypes.windll.kernel32.SetDllDirectoryW(None)  # don't let Resolve inherit our DLL dir
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        subprocess.Popen([str(install / "Resolve.exe")], cwd=str(install), env=_clean_env(),
+                         creationflags=flags, close_fds=True)
+    finally:
+        bundle = getattr(sys, "_MEIPASS", None)
+        if getattr(sys, "frozen", False) and bundle:
+            ctypes.windll.kernel32.SetDllDirectoryW(bundle)
 
 
 def _resolve_windows() -> list[int]:
@@ -174,17 +220,22 @@ def wait_ready(install: Path, timeout: float = 600, on_status=None):
         launch(install)
     deadline = time.time() + timeout
     r = None
-    tried_while_running = 0.0
+    failures = 0
+    window_since = 0.0
     while time.time() < deadline:
         if is_running():
             r = connect(install)
             if r is not None:
                 break
-            if tried_while_running == 0.0:
-                tried_while_running = time.time()
-            # Resolve has been up for a while but API never answers -> scripting off / free
-            if time.time() - tried_while_running > 90 and _main_window_up():
+            failures += 1
+            # Long-running Resolve that doesn't answer -> scripting off / free version.
+            if failures >= 3 and resolve_uptime() > 120:
                 raise ResolveError(SCRIPTING_HELP)
+            # Freshly started: the API comes up a few seconds after the window does.
+            if _main_window_up():
+                window_since = window_since or time.time()
+                if time.time() - window_since > 60:
+                    raise ResolveError(SCRIPTING_HELP)
         time.sleep(1)
     if r is None:
         raise ResolveError("DaVinci Resolve didn't start in time.")

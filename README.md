@@ -27,6 +27,9 @@ gets the lists through the scripting API.
 - **DaVinci Resolve Studio** 19, 20 or 21 (external scripting doesn't work in the free version)
 - In Resolve: **Preferences → System → General → External scripting using: Local**
 
+Tested on Resolve Studio 20 with a disk database. Resolve 19/21 and PostgreSQL/Cloud
+databases are supported by design but not tested yet — issues welcome.
+
 Media Location needs Resolve 20 or newer. Leave it empty to keep the location stored in the preset.
 
 ## Install
